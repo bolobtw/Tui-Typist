@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap, Padding},
 };
 use std::{
     io,
@@ -128,8 +128,7 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     let style_correct = Style::default().fg(Color::Green);
     let style_incorrect = Style::default().fg(Color::Red).bg(Color::Rgb(80, 0, 0));
     let style_untyped = Style::default().fg(Color::DarkGray);
-
-    let style_active = Style::default().fg(Color::White).underlined().bold();
+    let style_active = Style::default().fg(Color::Black).bg(Color::White).bold();
 
     let mut styled_spans = Vec::new();
 
@@ -153,8 +152,9 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
     let typing_area = Paragraph::new(Text::from(colored_text))
         .block(
             Block::default()
-                .title(" Typing Test ")
-                .borders(Borders::ALL),
+                .title(" Tui-Typist ")
+                .borders(Borders::ALL)
+                .padding(Padding::new(1, 1, 0, 0))
         )
         .wrap(Wrap { trim: false });
     f.render_widget(typing_area, chunks[1]);
