@@ -10,12 +10,16 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Wrap},
 };
+use serde::{Deserialize, Serialize};
 use std::{
-    io,
-    time::{Duration, Instant},
+    fs::{self, OpenOptions},
+    io::{self, BufRead, BufReader, Write},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const HISTORY_FILE: &str = "history.jsonl";
 
 #[derive(PartialEq)]
 enum AppState {
@@ -23,7 +27,7 @@ enum AppState {
     Finished,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct RunStats {
     wpm: f64,
     raw_wpm: f64,
@@ -31,6 +35,7 @@ struct RunStats {
     correct_chars: usize,
     total_chars: usize,
     duration_secs: f64,
+    timestamp: u64,
 }
 
 struct App {
@@ -42,6 +47,7 @@ struct App {
     total_keystrokes: usize,
     correct_keystrokes: usize,
     last_run: Option<RunStats>,
+    history: Vec<RunStats>,
 }
 
 impl App {
@@ -55,6 +61,7 @@ impl App {
             total_keystrokes: 0,
             correct_keystrokes: 0,
             last_run: None,
+            history: load_history(),
         };
         app.reset_run();
         app
@@ -118,15 +125,44 @@ impl App {
 
         let (wpm, raw_wpm, accuracy, correct_chars) = self.current_metrics();
 
-        self.last_run = Some(RunStats {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        let stats = RunStats {
             wpm,
             raw_wpm,
             accuracy,
             correct_chars,
             total_chars: self.total_keystrokes,
             duration_secs: elapsed_secs,
-        });
+            timestamp,
+        };
+
+        save_run_to_history(&stats);
+        self.history.push(stats.clone());
+        self.last_run = Some(stats);
         self.state = AppState::Finished;
+    }
+}
+
+fn load_history() -> Vec<RunStats> {
+    let Ok(file) = fs::File::open(HISTORY_FILE) else {
+        return Vec::new();
+    };
+    BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .filter_map(|line| serde_json::from_str::<RunStats>(&line).ok())
+        .collect()
+}
+
+fn save_run_to_history(stats: &RunStats) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(HISTORY_FILE) {
+        if let Ok(json) = serde_json::to_string(stats) {
+            let _ = writeln!(file, "{}", json);
+        }
     }
 }
 
@@ -293,37 +329,37 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([Constraint::Min(5)])
+        .constraints([Constraint::Length(9), Constraint::Min(5)])
         .split(f.area());
 
     if let Some(stats) = &app.last_run {
         let summary_lines = vec![
             Line::from(vec![
-                Span::styled(" Net WPM:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Net WPM:  ", Style::default()),
                 Span::styled(
                     format!("{:.1}", stats.wpm),
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" Raw WPM:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:.1}", stats.raw_wpm), Style::default().fg(Color::Yellow)),
+                Span::styled(" Raw WPM:  ", Style::default()),
+                Span::styled(format!("{:.1}", stats.raw_wpm), Style::default()),
             ]),
             Line::from(vec![
-                Span::styled(" Accuracy: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(" Accuracy: ", Style::default()),
                 Span::styled(
                     format!("{:.1}% ({}/{})", stats.accuracy, stats.correct_chars, stats.total_chars),
-                    Style::default().fg(Color::Yellow),
+                    Style::default(),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" Time:     ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{:.1}s", stats.duration_secs), Style::default().fg(Color::DarkGray)),
+                Span::styled(" Time:     ", Style::default()),
+                Span::styled(format!("{:.1}s", stats.duration_secs), Style::default()),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 " Press [Tab] or [Enter] to play again | [Esc] Quit",
-                Style::default().fg(Color::Yellow),
+                Style::default(),
             )),
         ];
 
@@ -331,8 +367,44 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .title(" Run Complete! ")
                 .borders(Borders::ALL)
-                .padding(Padding::new(1, 1, 1, 1)),
+                .padding(Padding::new(1, 1, 1, 0)),
         );
         f.render_widget(summary_block, chunks[0]);
     }
+
+    let header_cells = ["Run", "Net WPM", "Raw WPM", "Accuracy", "Time"]
+        .iter()
+        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let total_runs = app.history.len();
+    let rows = app.history.iter().enumerate().rev().take(10).map(|(idx, run)| {
+        Row::new(vec![
+            Cell::from(format!("#{}", idx + 1)),
+            Cell::from(format!("{:.1}", run.wpm)),
+            Cell::from(format!("{:.1}", run.raw_wpm)),
+            Cell::from(format!("{:.1}%", run.accuracy)),
+            Cell::from(format!("{:.1}s", run.duration_secs)),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(6),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(8),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(format!(" Past Runs (Total: {}) ", total_runs))
+            .borders(Borders::ALL)
+            .padding(Padding::new(1, 1, 1, 1)),
+    );
+
+    f.render_widget(table, chunks[1]);
 }
