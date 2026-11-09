@@ -744,7 +744,7 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
 
 fn render_help_modal(f: &mut ratatui::Frame, app: &App) {
     let theme = app.theme();
-    let area = centered_rect(46, 13, f.area());
+    let area = centered_rect(46, 15, f.area());
 
     let pill_style = Style::default()
         .fg(theme.active_fg)
@@ -754,33 +754,33 @@ fn render_help_modal(f: &mut ratatui::Frame, app: &App) {
 
     let help_lines = vec![
         Line::from(vec![
-            Span::styled("  Tab       ", pill_style),
+            Span::styled("   Tab   ", pill_style),
             Span::styled("  Restart current run", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Ctrl+D    ", pill_style),
+            Span::styled(" Ctrl+D  ", pill_style),
             Span::styled("  Cycle timer (30s / 60s / 90s)", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Ctrl+W    ", pill_style),
-            Span::styled("  Cycle wordlist", desc_style),
+            Span::styled(" Ctrl+W  ", pill_style),
+            Span::styled("  Cycle wordlists", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Ctrl+T    ", pill_style),
-            Span::styled("  Cycle theme", desc_style),
+            Span::styled(" Ctrl+T  ", pill_style),
+            Span::styled("  Cycle themes", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Ctrl+K    ", pill_style),
+            Span::styled(" Ctrl+K  ", pill_style),
             Span::styled("  Close this help menu", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  Esc       ", pill_style),
-            Span::styled("  Quit Tui-Typist", desc_style),
+            Span::styled("   Esc   ", pill_style),
+            Span::styled("  Close out of the app", desc_style),
         ]),
     ];
 
