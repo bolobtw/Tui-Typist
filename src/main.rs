@@ -3,14 +3,15 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use mlua::Lua;
 use rand::seq::SliceRandom;
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, Wrap},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -43,8 +44,74 @@ struct RunStats {
     timestamp: u64,
 }
 
+#[derive(Clone)]
+struct Theme {
+    header_fg: Color,
+    correct_fg: Color,
+    incorrect_fg: Color,
+    incorrect_bg: Color,
+    untyped_fg: Color,
+    active_fg: Color,
+    active_bg: Color,
+    border_fg: Color,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            header_fg: Color::White,
+            correct_fg: Color::Green,
+            incorrect_fg: Color::Red,
+            incorrect_bg: Color::Rgb(80, 0, 0),
+            untyped_fg: Color::DarkGray,
+            active_fg: Color::Black,
+            active_bg: Color::White,
+            border_fg: Color::White,
+        }
+    }
+}
+
+impl Theme {
+    fn from_lua_script(script: &str) -> Self {
+        let mut theme = Theme::default();
+        let lua = Lua::new();
+        if let Ok(table) = lua.load(script).eval::<mlua::Table>() {
+            let get_color = |key: &str, default: Color| -> Color {
+                table
+                    .get::<String>(key)
+                    .ok()
+                    .and_then(|s| parse_hex_color(&s))
+                    .unwrap_or(default)
+            };
+
+            theme.header_fg = get_color("header", theme.header_fg);
+            theme.correct_fg = get_color("correct", theme.correct_fg);
+            theme.incorrect_fg = get_color("incorrect_fg", theme.incorrect_fg);
+            theme.incorrect_bg = get_color("incorrect_bg", theme.incorrect_bg);
+            theme.untyped_fg = get_color("untyped", theme.untyped_fg);
+            theme.active_fg = get_color("active_fg", theme.active_fg);
+            theme.active_bg = get_color("active_bg", theme.active_bg);
+            theme.border_fg = get_color("border", theme.border_fg);
+        }
+        theme
+    }
+}
+
+fn parse_hex_color(hex: &str) -> Option<Color> {
+    let hex = hex.trim_start_matches('#');
+    if hex.len() == 6 {
+        let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+        let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+        let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+        Some(Color::Rgb(r, g, b))
+    } else {
+        None
+    }
+}
+
 struct App {
     state: AppState,
+    show_help: bool,
     target_words: String,
     user_input: String,
     start_time: Option<Instant>,
@@ -56,12 +123,13 @@ struct App {
     history: Vec<RunStats>,
     available_wordlists: Vec<(String, String)>,
     current_wordlist_idx: usize,
+    available_themes: Vec<(String, Theme)>,
+    current_theme_idx: usize,
 }
 
 impl App {
-    fn new(cli_wordlist: Option<String>) -> App {
+    fn new(cli_wordlist: Option<String>, cli_theme: Option<String>) -> App {
         let mut available_wordlists = Vec::new();
-
         if let Ok(entries) = fs::read_dir("wordlists") {
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -106,9 +174,52 @@ impl App {
             }
         }
 
+        let mut available_themes = vec![("default".to_string(), Theme::default())];
+        let mut custom_themes = Vec::new();
+
+        if let Ok(entries) = fs::read_dir("themes") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("lua") {
+                    if let Ok(script) = fs::read_to_string(&path) {
+                        let name = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("theme")
+                            .to_string();
+                        custom_themes.push((name, Theme::from_lua_script(&script)));
+                    }
+                }
+            }
+        }
+        custom_themes.sort_by(|a, b| a.0.cmp(&b.0));
+        available_themes.extend(custom_themes);
+
+        let mut current_theme_idx = available_themes
+            .iter()
+            .position(|(name, _)| name == "gruvbox")
+            .unwrap_or(if available_themes.len() > 1 { 1 } else { 0 });
+
+        if let Some(path_str) = cli_theme {
+            if let Ok(script) = fs::read_to_string(&path_str) {
+                let name = PathBuf::from(&path_str)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("cli")
+                    .to_string();
+                if let Some(pos) = available_themes.iter().position(|(n, _)| *n == name) {
+                    current_theme_idx = pos;
+                } else {
+                    available_themes.push((name, Theme::from_lua_script(&script)));
+                    current_theme_idx = available_themes.len() - 1;
+                }
+            }
+        }
+
         let preset_idx = 0;
         let mut app = App {
             state: AppState::Typing,
+            show_help: false,
             target_words: String::new(),
             user_input: String::new(),
             start_time: None,
@@ -120,9 +231,19 @@ impl App {
             history: load_history(),
             available_wordlists,
             current_wordlist_idx,
+            available_themes,
+            current_theme_idx,
         };
         app.reset_run();
         app
+    }
+
+    fn theme(&self) -> &Theme {
+        &self.available_themes[self.current_theme_idx].1
+    }
+
+    fn theme_name(&self) -> &str {
+        &self.available_themes[self.current_theme_idx].0
     }
 
     fn reset_run(&mut self) {
@@ -161,6 +282,10 @@ impl App {
         self.preset_idx = (self.preset_idx + 1) % TIME_PRESETS.len();
         self.time_limit = Duration::from_secs(TIME_PRESETS[self.preset_idx]);
         self.reset_run();
+    }
+
+    fn cycle_theme(&mut self) {
+        self.current_theme_idx = (self.current_theme_idx + 1) % self.available_themes.len();
     }
 
     fn current_metrics(&self) -> (f64, f64, f64, usize) {
@@ -252,6 +377,7 @@ fn save_run_to_history(stats: &RunStats) {
 fn main() -> Result<(), io::Error> {
     let args: Vec<String> = env::args().collect();
     let cli_wordlist = args.get(1).cloned();
+    let cli_theme = args.get(2).cloned();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -259,7 +385,7 @@ fn main() -> Result<(), io::Error> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(cli_wordlist);
+    let mut app = App::new(cli_wordlist, cli_theme);
     let res = run_app(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -286,6 +412,18 @@ where
                     continue;
                 }
 
+                if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('k') {
+                    app.show_help = !app.show_help;
+                    continue;
+                }
+
+                if app.show_help {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+                        app.show_help = false;
+                    }
+                    continue;
+                }
+
                 match (key.modifiers, key.code) {
                     (_, KeyCode::Esc) => return Ok(()),
                     (_, KeyCode::Tab) => {
@@ -298,6 +436,10 @@ where
                     }
                     (KeyModifiers::CONTROL, KeyCode::Char('d')) => {
                         app.cycle_time_preset();
+                        continue;
+                    }
+                    (KeyModifiers::CONTROL, KeyCode::Char('t')) => {
+                        app.cycle_theme();
                         continue;
                     }
                     _ => {}
@@ -338,7 +480,7 @@ where
             }
         }
 
-        if app.state == AppState::Typing {
+        if app.state == AppState::Typing && !app.show_help {
             if let Some(start) = app.start_time {
                 if start.elapsed() >= app.time_limit {
                     app.finish_run();
@@ -353,13 +495,22 @@ fn ui(f: &mut ratatui::Frame, app: &App) {
         AppState::Typing => render_typing_ui(f, app),
         AppState::Finished => render_finish_ui(f, app),
     }
+
+    if app.show_help {
+        render_help_modal(f, app);
+    }
 }
 
 fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
+    let theme = app.theme();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([Constraint::Length(3), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     let time_left = if let Some(start) = app.start_time {
@@ -372,40 +523,34 @@ fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
     let (wpm, _, _, _) = app.current_metrics();
     let (wordlist_name, _) = &app.available_wordlists[app.current_wordlist_idx];
 
-    let preset_display: Vec<String> = TIME_PRESETS
-        .iter()
-        .enumerate()
-        .map(|(i, &secs)| {
-            if i == app.preset_idx {
-                format!("[{}s]", secs)
-            } else {
-                format!("{}s", secs)
-            }
-        })
-        .collect();
-
     let header_text = format!(
-        " Time: {}s | WPM: {:.0} | Mode: {} (Ctrl+D) | List: [{}] (Ctrl+W) | Tab: Restart | Esc: Quit ",
+        " Time: {}s | WPM: {:.0} | List: {} | Theme: {} ",
         time_left,
         wpm,
-        preset_display.join("/"),
-        wordlist_name
+        wordlist_name,
+        app.theme_name()
     );
 
     let header = Paragraph::new(header_text)
-        .block(Block::default().borders(Borders::ALL))
-        .style(Style::default().fg(Color::Yellow));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_fg)),
+        )
+        .style(Style::default().fg(theme.header_fg));
     f.render_widget(header, chunks[0]);
 
     let target_chars: Vec<char> = app.target_words.chars().collect();
     let input_chars: Vec<char> = app.user_input.chars().collect();
 
-    let style_correct = Style::default().fg(Color::Green);
-    let style_incorrect = Style::default().fg(Color::Red).bg(Color::Rgb(80, 0, 0));
-    let style_untyped = Style::default().fg(Color::DarkGray);
+    let style_correct = Style::default().fg(theme.correct_fg);
+    let style_incorrect = Style::default()
+        .fg(theme.incorrect_fg)
+        .bg(theme.incorrect_bg);
+    let style_untyped = Style::default().fg(theme.untyped_fg);
     let style_active = Style::default()
-        .fg(Color::Black)
-        .bg(Color::White)
+        .fg(theme.active_fg)
+        .bg(theme.active_bg)
         .add_modifier(Modifier::BOLD);
 
     let mut styled_spans = Vec::with_capacity(target_chars.len());
@@ -430,13 +575,30 @@ fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
             Block::default()
                 .title(" Tui-Typist ")
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_fg))
                 .padding(Padding::new(1, 1, 1, 1)),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(typing_area, chunks[1]);
+
+    let footer_line = Line::from(vec![
+        Span::styled(
+            " Ctrl+K ",
+            Style::default()
+                .fg(theme.active_fg)
+                .bg(theme.border_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Help ", Style::default().fg(theme.untyped_fg)),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer_line).alignment(Alignment::Right),
+        chunks[2],
+    );
 }
 
 fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
+    let theme = app.theme();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
@@ -446,20 +608,26 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
     if let Some(stats) = &app.last_run {
         let summary_lines = vec![
             Line::from(vec![
-                Span::styled(" Net WPM:  ", Style::default()),
+                Span::styled(" Net WPM:      ", Style::default()),
                 Span::styled(
                     format!("{:.1}", stats.wpm),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
-                Span::styled(" Raw WPM:  ", Style::default()),
-                Span::styled(format!("{:.1}", stats.raw_wpm), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Raw WPM:      ", Style::default()),
+                Span::styled(
+                    format!("{:.1}", stats.raw_wpm),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
-                Span::styled(" Accuracy: ", Style::default()),
+                Span::styled(" Accuracy:     ", Style::default()),
                 Span::styled(
-                    format!("{:.1}% ({}/{})", stats.accuracy, stats.correct_chars, stats.total_chars),
+                    format!(
+                        "{:.1}% ({}/{})",
+                        stats.accuracy, stats.correct_chars, stats.total_chars
+                    ),
                     Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -467,20 +635,44 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
                 Span::styled(" Time / List:  ", Style::default()),
                 Span::styled(
                     format!("{:.1}s on [{}]", stats.duration_secs, stats.wordlist_name),
-                    Style::default(),
+                    Style::default().add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                " [Tab/Enter] Restart | [Ctrl+D] Timer (30/60/90s) | [Ctrl+W] Wordlist | [Esc] Quit",
-                Style::default(),
-            )),
+            Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    " Tab ",
+                    Style::default()
+                        .fg(theme.active_fg)
+                        .bg(theme.border_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Restart  ", Style::default().fg(theme.untyped_fg)),
+                Span::styled(
+                    " Ctrl+K ",
+                    Style::default()
+                        .fg(theme.active_fg)
+                        .bg(theme.border_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Help  ", Style::default().fg(theme.untyped_fg)),
+                Span::styled(
+                    " Esc ",
+                    Style::default()
+                        .fg(theme.active_fg)
+                        .bg(theme.border_fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" Quit", Style::default().fg(theme.untyped_fg)),
+            ]),
         ];
 
         let summary_block = Paragraph::new(summary_lines).block(
             Block::default()
                 .title(" Run Complete! ")
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.border_fg))
                 .padding(Padding::new(1, 1, 1, 0)),
         );
         f.render_widget(summary_block, chunks[0]);
@@ -488,11 +680,34 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
 
     let header_cells = ["Run", "Net WPM", "Raw WPM", "Accuracy", "Time", "Wordlist"]
         .iter()
-        .map(|h| Cell::from(*h).style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+        .map(|h| {
+            Cell::from(*h).style(
+                Style::default()
+                    .fg(theme.header_fg)
+                    .add_modifier(Modifier::BOLD),
+            )
+        });
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let total_runs = app.history.len();
+
+    let best_run_idx = app
+        .history
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.wpm.total_cmp(&b.wpm))
+        .map(|(idx, _)| idx);
+
     let rows = app.history.iter().enumerate().rev().take(10).map(|(idx, run)| {
+        let is_best = best_run_idx == Some(idx) && run.wpm > 0.0;
+        let row_style = if is_best {
+            Style::default()
+                .fg(theme.correct_fg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
         Row::new(vec![
             Cell::from(format!("#{}", idx + 1)),
             Cell::from(format!("{:.1}", run.wpm)),
@@ -501,6 +716,7 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
             Cell::from(format!("{:.1}s", run.duration_secs)),
             Cell::from(run.wordlist_name.clone()),
         ])
+        .style(row_style)
     });
 
     let table = Table::new(
@@ -519,8 +735,72 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
         Block::default()
             .title(format!(" Past Runs (Total: {}) ", total_runs))
             .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.border_fg))
             .padding(Padding::new(1, 1, 1, 1)),
     );
 
     f.render_widget(table, chunks[1]);
+}
+
+fn render_help_modal(f: &mut ratatui::Frame, app: &App) {
+    let theme = app.theme();
+    let area = centered_rect(46, 13, f.area());
+
+    let pill_style = Style::default()
+        .fg(theme.active_fg)
+        .bg(theme.border_fg)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(theme.active_bg);
+
+    let help_lines = vec![
+        Line::from(vec![
+            Span::styled("  Tab       ", pill_style),
+            Span::styled("  Restart current run", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Ctrl+D    ", pill_style),
+            Span::styled("  Cycle timer (30s / 60s / 90s)", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Ctrl+W    ", pill_style),
+            Span::styled("  Cycle wordlist", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Ctrl+T    ", pill_style),
+            Span::styled("  Cycle theme", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Ctrl+K    ", pill_style),
+            Span::styled("  Close this help menu", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  Esc       ", pill_style),
+            Span::styled("  Quit Tui-Typist", desc_style),
+        ]),
+    ];
+
+    let modal = Paragraph::new(help_lines).block(
+        Block::default()
+            .title(" Keybindings ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(theme.header_fg))
+            .padding(Padding::new(1, 1, 1, 1)),
+    );
+
+    f.render_widget(Clear, area);
+    f.render_widget(modal, area);
+}
+
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let vertical = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .split(r);
+    Layout::horizontal([Constraint::Length(width)])
+        .flex(Flex::Center)
+        .split(vertical[0])[0]
 }
