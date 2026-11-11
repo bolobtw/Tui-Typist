@@ -1,8 +1,4 @@
-use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+use crossterm::{event::{self, Event, KeyCode, KeyEventKind, KeyModifiers}, execute, terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode}, };
 use mlua::Lua;
 use rand::seq::SliceRandom;
 use ratatui::{
@@ -11,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, Wrap},
+    widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table, TableState, Wrap},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -113,14 +109,17 @@ struct App {
     state: AppState,
     show_help: bool,
     target_words: String,
+    target_chars: Vec<char>,
     user_input: String,
     start_time: Option<Instant>,
+    accumulated_time: Duration,
     preset_idx: usize,
     time_limit: Duration,
     total_keystrokes: usize,
     correct_keystrokes: usize,
     last_run: Option<RunStats>,
     history: Vec<RunStats>,
+    history_state: TableState,
     available_wordlists: Vec<(String, String)>,
     current_wordlist_idx: usize,
     available_themes: Vec<(String, Theme)>,
@@ -221,14 +220,17 @@ impl App {
             state: AppState::Typing,
             show_help: false,
             target_words: String::new(),
+            target_chars: Vec::new(),
             user_input: String::new(),
             start_time: None,
+            accumulated_time: Duration::ZERO,
             preset_idx,
             time_limit: Duration::from_secs(TIME_PRESETS[preset_idx]),
             total_keystrokes: 0,
             correct_keystrokes: 0,
             last_run: None,
             history: load_history(),
+            history_state: TableState::default(),
             available_wordlists,
             current_wordlist_idx,
             available_themes,
@@ -244,6 +246,43 @@ impl App {
 
     fn theme_name(&self) -> &str {
         &self.available_themes[self.current_theme_idx].0
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.accumulated_time + self.start_time.map_or(Duration::ZERO, |s| s.elapsed())
+    }
+
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        if self.show_help {
+            if let Some(start) = self.start_time.take() {
+                self.accumulated_time += start.elapsed();
+            }
+        } else if self.state == AppState::Typing && !self.user_input.is_empty() {
+            self.start_time = Some(Instant::now());
+        }
+    }
+
+    fn scroll_history_down(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let i = match self.history_state.selected() {
+            Some(i) => (i + 1).min(self.history.len() - 1),
+            None => 0,
+        };
+        self.history_state.select(Some(i));
+    }
+
+    fn scroll_history_up(&mut self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let i = match self.history_state.selected() {
+            Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        self.history_state.select(Some(i));
     }
 
     fn reset_run(&mut self) {
@@ -266,8 +305,10 @@ impl App {
             self.target_words = "the quick brown fox jumps over the lazy dog".to_string();
         }
 
+        self.target_chars = self.target_words.chars().collect();
         self.user_input.clear();
         self.start_time = None;
+        self.accumulated_time = Duration::ZERO;
         self.total_keystrokes = 0;
         self.correct_keystrokes = 0;
         self.state = AppState::Typing;
@@ -289,14 +330,12 @@ impl App {
     }
 
     fn current_metrics(&self) -> (f64, f64, f64, usize) {
-        let elapsed_secs = self
-            .start_time
-            .map(|s| s.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let elapsed_secs = self.elapsed().as_secs_f64();
 
         let correct_on_screen = self
-            .target_words
-            .chars()
+            .target_chars
+            .iter()
+            .copied()
             .zip(self.user_input.chars())
             .filter(|(t, u)| t == u)
             .count();
@@ -324,10 +363,7 @@ impl App {
         if self.state == AppState::Finished {
             return;
         }
-        let elapsed_secs = self
-            .start_time
-            .map(|s| s.elapsed().as_secs_f64().min(self.time_limit.as_secs_f64()))
-            .unwrap_or(0.0);
+        let elapsed_secs = self.elapsed().as_secs_f64().min(self.time_limit.as_secs_f64());
 
         let (wpm, raw_wpm, accuracy, correct_chars) = self.current_metrics();
         let (wordlist_name, _) = &self.available_wordlists[self.current_wordlist_idx];
@@ -350,6 +386,7 @@ impl App {
 
         save_run_to_history(&stats);
         self.history.push(stats.clone());
+        self.history_state.select(Some(0));
         self.last_run = Some(stats);
         self.state = AppState::Finished;
     }
@@ -413,13 +450,13 @@ where
                 }
 
                 if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('k') {
-                    app.show_help = !app.show_help;
+                    app.toggle_help();
                     continue;
                 }
 
                 if app.show_help {
                     if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
-                        app.show_help = false;
+                        app.toggle_help();
                     }
                     continue;
                 }
@@ -446,51 +483,56 @@ where
                 }
 
                 match app.state {
-                    AppState::Typing => match key.code {
-                        KeyCode::Backspace => {
+                    AppState::Typing => match (key.modifiers, key.code) {
+                        (KeyModifiers::CONTROL, KeyCode::Backspace)
+                        | (KeyModifiers::CONTROL, KeyCode::Char('h')) => {
+                            while app.user_input.ends_with(' ') {
+                                app.user_input.pop();
+                            }
+                            while !app.user_input.is_empty() && !app.user_input.ends_with(' ') {
+                                app.user_input.pop();
+                            }
+                        }
+                        (_, KeyCode::Backspace) => {
                             app.user_input.pop();
                         }
-                        KeyCode::Char(c) => {
-                            let target_chars: Vec<char> = app.target_words.chars().collect();
+                        (_, KeyCode::Char(c)) => {
                             let input_len = app.user_input.chars().count();
 
-                            if input_len < target_chars.len() {
+                            if input_len < app.target_chars.len() {
                                 if app.start_time.is_none() {
                                     app.start_time = Some(Instant::now());
                                 }
                                 app.total_keystrokes += 1;
-                                if target_chars[input_len] == c {
+                                if app.target_chars[input_len] == c {
                                     app.correct_keystrokes += 1;
                                 }
                                 app.user_input.push(c);
 
-                                if app.user_input.chars().count() == target_chars.len() {
+                                if input_len + 1 == app.target_chars.len() {
                                     app.finish_run();
                                 }
                             }
                         }
                         _ => {}
                     },
-                    AppState::Finished => {
-                        if key.code == KeyCode::Enter {
-                            app.reset_run();
-                        }
-                    }
+                    AppState::Finished => match key.code {
+                        KeyCode::Enter => app.reset_run(),
+                        KeyCode::Char('j') | KeyCode::Down => app.scroll_history_down(),
+                        KeyCode::Char('k') | KeyCode::Up => app.scroll_history_up(),
+                        _ => {}
+                    },
                 }
             }
         }
 
-        if app.state == AppState::Typing && !app.show_help {
-            if let Some(start) = app.start_time {
-                if start.elapsed() >= app.time_limit {
-                    app.finish_run();
-                }
-            }
+        if app.state == AppState::Typing && !app.show_help && app.elapsed() >= app.time_limit {
+            app.finish_run();
         }
     }
 }
 
-fn ui(f: &mut ratatui::Frame, app: &App) {
+fn ui(f: &mut ratatui::Frame, app: &mut App) {
     match app.state {
         AppState::Typing => render_typing_ui(f, app),
         AppState::Finished => render_finish_ui(f, app),
@@ -513,12 +555,7 @@ fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(f.area());
 
-    let time_left = if let Some(start) = app.start_time {
-        let elapsed = start.elapsed().as_secs();
-        app.time_limit.as_secs().saturating_sub(elapsed)
-    } else {
-        app.time_limit.as_secs()
-    };
+    let time_left = app.time_limit.as_secs().saturating_sub(app.elapsed().as_secs());
 
     let (wpm, _, _, _) = app.current_metrics();
     let (wordlist_name, _) = &app.available_wordlists[app.current_wordlist_idx];
@@ -540,7 +577,6 @@ fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
         .style(Style::default().fg(theme.header_fg));
     f.render_widget(header, chunks[0]);
 
-    let target_chars: Vec<char> = app.target_words.chars().collect();
     let input_chars: Vec<char> = app.user_input.chars().collect();
 
     let style_correct = Style::default().fg(theme.correct_fg);
@@ -553,9 +589,9 @@ fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
         .bg(theme.active_bg)
         .add_modifier(Modifier::BOLD);
 
-    let mut styled_spans = Vec::with_capacity(target_chars.len());
+    let mut styled_spans = Vec::with_capacity(app.target_chars.len());
 
-    for (index, &target_char) in target_chars.iter().enumerate() {
+    for (index, &target_char) in app.target_chars.iter().enumerate() {
         let span = if index < input_chars.len() {
             if input_chars[index] == target_char {
                 Span::styled(target_char.to_string(), style_correct)
@@ -597,12 +633,16 @@ fn render_typing_ui(f: &mut ratatui::Frame, app: &App) {
     );
 }
 
-fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
-    let theme = app.theme();
+fn render_finish_ui(f: &mut ratatui::Frame, app: &mut App) {
+    let theme = app.theme().clone();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([Constraint::Length(9), Constraint::Min(5)])
+        .constraints([
+            Constraint::Length(9),
+            Constraint::Min(5),
+            Constraint::Length(1),
+        ])
         .split(f.area());
 
     if let Some(stats) = &app.last_run {
@@ -642,7 +682,7 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
-                    " Tab ",
+                    " Tab/Enter ",
                     Style::default()
                         .fg(theme.active_fg)
                         .bg(theme.border_fg)
@@ -650,13 +690,13 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
                 ),
                 Span::styled(" Restart  ", Style::default().fg(theme.untyped_fg)),
                 Span::styled(
-                    " Ctrl+K ",
+                    "  j/k  ",
                     Style::default()
                         .fg(theme.active_fg)
                         .bg(theme.border_fg)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(" Help  ", Style::default().fg(theme.untyped_fg)),
+                Span::styled(" Scroll  ", Style::default().fg(theme.untyped_fg)),
                 Span::styled(
                     " Esc ",
                     Style::default()
@@ -698,7 +738,7 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
         .max_by(|(_, a), (_, b)| a.wpm.total_cmp(&b.wpm))
         .map(|(idx, _)| idx);
 
-    let rows = app.history.iter().enumerate().rev().take(10).map(|(idx, run)| {
+    let rows = app.history.iter().enumerate().rev().map(|(idx, run)| {
         let is_best = best_run_idx == Some(idx) && run.wpm > 0.0;
         let row_style = if is_best {
             Style::default()
@@ -731,6 +771,13 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
         ],
     )
     .header(header)
+    .row_highlight_style(
+        Style::default()
+            .fg(theme.active_fg)
+            .bg(theme.active_bg)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("▸ ")
     .block(
         Block::default()
             .title(format!(" Past Runs (Total: {}) ", total_runs))
@@ -739,12 +786,27 @@ fn render_finish_ui(f: &mut ratatui::Frame, app: &App) {
             .padding(Padding::new(1, 1, 1, 1)),
     );
 
-    f.render_widget(table, chunks[1]);
+    f.render_stateful_widget(table, chunks[1], &mut app.history_state);
+
+    let footer_line = Line::from(vec![
+        Span::styled(
+            " Ctrl+K ",
+            Style::default()
+                .fg(theme.active_fg)
+                .bg(theme.border_fg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Help ", Style::default().fg(theme.untyped_fg)),
+    ]);
+    f.render_widget(
+        Paragraph::new(footer_line).alignment(Alignment::Right),
+        chunks[2],
+    );
 }
 
 fn render_help_modal(f: &mut ratatui::Frame, app: &App) {
     let theme = app.theme();
-    let area = centered_rect(46, 15, f.area());
+    let area = centered_rect(50, 19, f.area());
 
     let pill_style = Style::default()
         .fg(theme.active_fg)
@@ -754,32 +816,42 @@ fn render_help_modal(f: &mut ratatui::Frame, app: &App) {
 
     let help_lines = vec![
         Line::from(vec![
-            Span::styled("   Tab   ", pill_style),
+            Span::styled("      Tab      ", pill_style),
             Span::styled("  Restart current run", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Ctrl+D  ", pill_style),
+            Span::styled(" Ctrl+Backspace", pill_style),
+            Span::styled("  Delete whole word", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("    Ctrl+D     ", pill_style),
             Span::styled("  Cycle timer (30s / 60s / 90s)", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Ctrl+W  ", pill_style),
+            Span::styled("    Ctrl+W     ", pill_style),
             Span::styled("  Cycle wordlists", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Ctrl+T  ", pill_style),
+            Span::styled("    Ctrl+T     ", pill_style),
             Span::styled("  Cycle themes", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Ctrl+K  ", pill_style),
+            Span::styled("   j/k  / ↑/↓  ", pill_style),
+            Span::styled("  Scroll past runs", desc_style),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("    Ctrl+K     ", pill_style),
             Span::styled("  Close this help menu", desc_style),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("   Esc   ", pill_style),
+            Span::styled("      Esc      ", pill_style),
             Span::styled("  Close out of the app", desc_style),
         ]),
     ];

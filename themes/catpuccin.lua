@@ -2,7 +2,7 @@ return {
     header = "#f9e2af",
     correct = "#a6e3a1",
     incorrect_fg = "#f38ba8",
-    incorrect_bg = "#45475a",
+    incorrect_bg = "#500000",
     untyped = "#6c7086",
     active_fg = "#1e1e2e",
     active_bg = "#cdd6f4",
